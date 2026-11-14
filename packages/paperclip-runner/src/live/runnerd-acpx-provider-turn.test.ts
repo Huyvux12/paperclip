@@ -106,8 +106,13 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
       timeoutMs: 30_000, resolveMissingResult,
       providerTurnWait: options.capMs === undefined ? undefined : { capMs: options.capMs },
     }).then(() => "finalized", (error: unknown) => String(error instanceof Error ? error.message : error));
+    const elapsedMs = Date.now() - started;
+    await bundle.transport.close().catch(() => undefined);
     const journalled = await calls();
-    return { outcome, appended, completeRun, resolveMissingResult, journalled, root, elapsedMs: Date.now() - started };
+    const providerPids = journalled.flatMap(entry => [entry.processStart, entry.childPid]).filter((pid): pid is number => typeof pid === "number");
+    await vi.waitFor(() => { for (const pid of providerPids) expect(alive(pid)).toBe(false); }, { timeout: 5_000, interval: 50 }).catch(() => undefined);
+    const providerProcesses = providerPids.map(pid => ({ pid, exited: !alive(pid) }));
+    return { outcome, appended, completeRun, resolveMissingResult, journalled, providerProcesses, root, elapsedMs };
   } catch (error) {
     const diagnostics = (await readFile(join(root, "native.stderr"), "utf8").catch(() => ""))
       + (await readFile(join(root, "diagnostics", "runnerd.stderr.log"), "utf8").catch(() => ""));
@@ -145,9 +150,8 @@ it.skipIf(process.platform === "win32")("ends the wait at the cap and takes toda
     terminalEvent: expect.objectContaining({ eventType: "turn.completed", payload: expect.objectContaining({ awaitingProviderTurn: true }) }) }));
   expect(run.appended.some(event => event.payload.status === "provider_turn_wait_ended")).toBe(true);
   expect(run.appended.some(event => event.payload.origin === "provider")).toBe(false);
-  const processes = run.journalled.filter(entry => typeof entry.processStart === "number").map(entry => entry.processStart as number);
-  expect(processes.length).toBeGreaterThan(0);
-  await vi.waitFor(() => { for (const pid of processes) expect(alive(pid)).toBe(false); }, { timeout: 10_000 });
+  expect(run.providerProcesses.length).toBeGreaterThan(1);
+  expect(run.providerProcesses.filter(entry => !entry.exited)).toEqual([]);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("ends the wait in seconds, not at the cap, when the provider process is lost while awaiting", async () => {
