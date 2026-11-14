@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 const PROJECTED_INPUT_PROVIDER_ID: &str = "input / réquest";
 
 static BACKGROUND_TASKS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static PROVIDER_TURNS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn background_tasks_mode(snapshot: bool) -> Option<String> {
     let path = BACKGROUND_TASKS.get()?.as_ref()?;
@@ -116,7 +118,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let stdin = io::stdin();
+    let (line_sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if line_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let mut stdout = io::stdout().lock();
     let mut next_sequence = 1_u64;
     let mut goal = Value::Null;
@@ -126,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_provider_run: Option<String> = None;
     let mut provider_rearmable = false;
     let mut source_pending_completion: Option<String> = None;
+    let mut open_provider_turn: Option<String> = None;
     let mut source_goal_revision = 0_u64;
     let mut runtime_directory: Option<std::path::PathBuf> = None;
     // `--cancel-reply lost|late`: the provider stops its prompt, but the reply
@@ -173,7 +183,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    for line in stdin.lock().lines() {
+    loop {
+        if open_provider_turn.is_some()
+            && !provider_turn_tokens()
+                .iter()
+                .any(|token| token == "provider-turn-pause")
+        {
+            open_provider_turn = None;
+            next_sequence = finish_provider_turn(&mut stdout, next_sequence, &source_run)?;
+        }
+        let wait = if open_provider_turn.is_some() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_secs(3_600)
+        };
+        let line = match lines.recv_timeout(wait) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let request: Value = serde_json::from_str(&line?)?;
         let id = request
             .get("id")
@@ -274,6 +302,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         next_sequence,
                         &run,
                         &mut source_pending_completion,
+                        &mut open_provider_turn,
                     )?;
                 }
             }
@@ -311,12 +340,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 std::thread::sleep(Duration::from_millis(delay));
             }
-            if let (true, Some(run)) = (armed, pending_provider_run.take()) {
+            let run = pending_provider_run.take().or_else(|| {
+                (provider_rearmable && chained_provider_turn_remains()).then(|| source_run.clone())
+            });
+            if let (true, Some(run)) = (armed, run) {
                 next_sequence = write_provider_turn(
                     &mut stdout,
                     next_sequence,
                     &run,
                     &mut source_pending_completion,
+                    &mut open_provider_turn,
                 )?;
                 provider_rearmable = tokens.iter().any(|token| token == "provider-terminal-live");
             } else {
@@ -346,7 +379,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             if command == "session.snapshot" {
                 response["result"] = json!({"identity":session_identity, "runId":source_run,
-                    "turnId":if fault == "active" {json!("unexpected-turn")} else {json!(source_pending_completion)},
+                    "turnId":if fault == "active" {json!("unexpected-turn")} else {json!(source_pending_completion.as_ref().or(open_provider_turn.as_ref()))},
                     "pendingToolCount":if fault == "tool" || source_pending_completion.is_some() {1} else {0}, "pendingInputCount":0,
                     "pendingRuntimeRequests":[]});
             }
@@ -1591,12 +1624,43 @@ fn bootstrap_success(
 }
 
 fn provider_turn_tokens() -> Vec<String> {
-    BACKGROUND_TASKS
+    let mut tokens: Vec<String> = BACKGROUND_TASKS
         .get()
         .and_then(Option::as_ref)
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|modes| modes.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let index = PROVIDER_TURNS_STARTED
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .max(1);
+    let spec = provider_turn_chain(&tokens).and_then(|chain| chain.into_iter().nth(index - 1));
+    if let Some(spec) = spec {
+        tokens.push(format!("provider-turn-id=provider-{index}"));
+        tokens.extend(
+            spec.split('+')
+                .filter_map(|flag| match flag {
+                    "live" => Some("provider-terminal-live"),
+                    "result" => Some("provider-result"),
+                    "resolved" => Some("provider-result-resolved"),
+                    _ => None,
+                })
+                .map(str::to_owned),
+        );
+    }
+    tokens
+}
+
+fn provider_turn_chain(tokens: &[String]) -> Option<Vec<String>> {
+    tokens
+        .iter()
+        .find_map(|token| token.strip_prefix("provider-turns="))
+        .map(|chain| chain.split('/').map(str::to_owned).collect())
+}
+
+fn chained_provider_turn_remains() -> bool {
+    provider_turn_chain(&provider_turn_tokens()).is_some_and(|chain| {
+        PROVIDER_TURNS_STARTED.load(std::sync::atomic::Ordering::SeqCst) < chain.len()
+    })
 }
 
 fn offer_provider_turn(
@@ -1611,7 +1675,7 @@ fn offer_provider_turn(
         return Ok(sequence);
     }
     if tokens.iter().any(|token| token == "provider-turn-unarmed") {
-        return write_provider_turn(output, sequence, default_run, pending_finish);
+        return write_provider_turn(output, sequence, default_run, pending_finish, &mut None);
     }
     *pending = Some(default_run.to_owned());
     Ok(sequence)
@@ -1622,7 +1686,11 @@ fn write_provider_turn(
     mut sequence: u64,
     default_run: &str,
     pending_finish: &mut Option<String>,
+    open_turn: &mut Option<String>,
 ) -> io::Result<u64> {
+    if provider_turn_chain(&provider_turn_tokens()).is_some() {
+        PROVIDER_TURNS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let tokens = provider_turn_tokens();
     if !tokens.iter().any(|token| token == "provider-turn") {
         return Ok(sequence);
@@ -1695,6 +1763,18 @@ fn write_provider_turn(
             ),
         )?;
         *pending_finish = Some(turn_id);
+        return Ok(sequence + 1);
+    }
+    if tokens.iter().any(|token| token == "provider-turn-pause") {
+        write_json(
+            output,
+            &frame(
+                sequence,
+                "runtime.event",
+                json!({"type":"text_delta","text":"Claude is still working."}),
+            ),
+        )?;
+        *open_turn = Some(turn_id);
         return Ok(sequence + 1);
     }
     finish_provider_turn(output, sequence, default_run)

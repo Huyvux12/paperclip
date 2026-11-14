@@ -238,23 +238,25 @@ it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in",
   expectCleanClose(run);
 }, 60_000);
 
-it.skipIf(process.platform === "win32").each([true, false])("delivers the provider's own turn that ran while the controller was away, after a restart during the wait (result: %s)", async withResult => {
+async function runRestartScenario(tokens: string, options: { waitMs: number; lastTurnId: string; resumeTokens?: string }) {
+  const n = ++scenario;
   const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-restart-")));
   const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
+  const background = join(root, "background");
   const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
   await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
   await writeFile(script, "qualified fixture entry");
-  await writeFile(join(root, "background"), `live provider-turn ${withResult ? "provider-result-resolved " : ""}provider-goal-at-terminal provider-turn-delay-ms=1500`);
-  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(join(root, "background"))} --spawn-owned-child\n`, { mode: 0o700 });
+  await writeFile(background, tokens);
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(background)} --spawn-owned-child\n`, { mode: 0o700 });
   let authority: DurablePrpControlPlane | null = null, registrations = 0;
   const diagnostics: string[] = [];
   const server = createServer();
   server.on("upgrade", (request, socket, head) => authority ? authority.handleUpgrade(request, socket, "/runner", head) : socket.destroy());
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   const address = server.address(); if (!address || typeof address === "string") throw new Error("missing fixture listener");
-  const identity = { runnerInstanceId: "runner-provider-turn-restart", environmentLeaseId: "lease-provider-turn-restart", runId: "run-provider-turn-restart",
-    normalizedSessionId: "session-provider-turn-restart", turnId: "turn-provider-turn-restart", itemId: "item-provider-turn-restart" };
-  const nativeIdentity = { companyId: "company-restart", agentId: "agent", issueId: "issue", runId: identity.runId, sessionId: identity.normalizedSessionId };
+  const identity = { runnerInstanceId: `runner-provider-turn-restart-${n}`, environmentLeaseId: `lease-provider-turn-restart-${n}`, runId: `run-provider-turn-restart-${n}`,
+    normalizedSessionId: `session-provider-turn-restart-${n}`, turnId: `turn-provider-turn-restart-${n}`, itemId: `item-provider-turn-restart-${n}` };
+  const nativeIdentity = { companyId: `company-restart-${n}`, agentId: "agent", issueId: "issue", runId: identity.runId, sessionId: identity.normalizedSessionId };
   const execution: NativeExecutionInput = { schema: "paperclip.native-execution-input.v1",
     binding: { companyId: nativeIdentity.companyId, agentId: "agent", issueId: "issue", runId: identity.runId, executionWorkspaceId: "workspace" },
     task: { identifier: "TASK-1", title: "Install and test", description: null, prompt: "Install and test", workMode: "standard" },
@@ -266,7 +268,7 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
     interactionResponses: [], credentialBindings: [] };
   const runnerPids = new Set<number>();
   let requirements: RunnerProviderLaunchRequirements | undefined;
-  const options: CapabilityRunnerdCodexTransportOptions = {
+  const transportOptions: CapabilityRunnerdCodexTransportOptions = {
     provider: "acpx", acpxAgent: "claude", providerStartedTurns: true, onDiagnostic: message => diagnostics.push(message), runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
     runnerArtifact: readRunnerdArtifactBinding(binary), codexSourceRecoveryVersion: 1, acpxSourceRecoveryVersion: 1,
     lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null }, runnerProcessReconnectGraceMs: null, runnerReconnectGraceMs: 10_000,
@@ -295,41 +297,41 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
   const backend = (transport: CapabilityRunnerdCodexTransport) => createNativeSessionBackend(execution, { codexTransportFactory: () => transport.transport,
     environment: { PAPERCLIP_WORKSPACE_CWD: root }, dynamicTools: [] });
   try {
-    const first = createCapabilityRunnerdCodexTransport(options);
+    const first = createCapabilityRunnerdCodexTransport(transportOptions);
     const session = await backend(first).openSession({ identity: nativeIdentity, workingDirectory: root });
     await session.startTurn({ message: { role: "user", text: "Install and test." } });
     for await (const event of session.events()) if (event.eventType === "turn.completed") break;
     const checkpoint = await session.snapshot();
-    expect(checkpoint).toMatchObject({ activeTurnId: null, semanticResult: null, awaitingProviderTurn: true });
     const pid = first.evidence().runnerPid!, startedAt = first.transport.processInfo!().startedAt;
     await session.detachControllerForRestart!();
-    await new Promise(done => setTimeout(done, 2_500));
-    const second = createCapabilityRunnerdCodexTransport({ ...options, recoveryLaunch: { requirements: requirements! },
+    await new Promise(done => setTimeout(done, options.waitMs));
+    const atRestart = { journalled: await calls(), durable: await durableState(root) };
+    const second = createCapabilityRunnerdCodexTransport({ ...transportOptions, recoveryLaunch: { requirements: requirements! },
       resumeProviderSession: { driverSessionId: checkpoint.sessionId, providerSessionId: checkpoint.providerSessionId!, providerIdentity: checkpoint.providerIdentity },
       authorityRunId: identity.runId, runnerProcessLauncher: () => { throw new Error("duplicate runner launch"); },
       adoptExistingRunner: { pid, processGroupId: pid, startedAt, isAlive: () => alive(pid), signal: () => false } });
+    const serverRequests: Array<Record<string, any>> = [];
+    const install = second.transport.setServerRequestHandler.bind(second.transport);
+    second.transport.setServerRequestHandler = handler => install(async request => {
+      const response = await handler(request);
+      serverRequests.push(structuredClone({ method: request.method, params: request.params, response }));
+      return response;
+    });
     const recovery = await backend(second).recoverSession!(checkpoint, { signal: new AbortController().signal });
-    expect(recovery.recovered, recovery.reason).toBe(true);
-    expect(second.evidence().runnerPid).toBe(pid);
-    const delivered: PrpEvent[] = [];
-    for await (const event of recovery.session!.events()) {
-      delivered.push(event);
-      if (event.eventType === "session.failed" || (event.eventType === "turn.completed" && event.turnId === "provider-1")) break;
+    const result = { checkpoint, pid, recoveredPid: second.evidence().runnerPid, recovered: recovery.recovered, reason: recovery.reason, atRestart, serverRequests,
+      delivered: [] as PrpEvent[], snapshot: null as unknown, closeOutcome: "not closed", journalled: [] as Array<Record<string, any>>, diagnostics, durable: "" };
+    if (recovery.session) {
+      if (options.resumeTokens !== undefined) await writeFile(background, options.resumeTokens);
+      const events = recovery.session.events()[Symbol.asyncIterator]();
+      const timeout = new Promise<null>(done => setTimeout(() => done(null), 15_000));
+      for (let next = await Promise.race([events.next(), timeout]); next && !next.done; next = await Promise.race([events.next(), timeout])) {
+        result.delivered.push(next.value);
+        if (next.value.eventType === "session.failed" || (next.value.eventType === "turn.completed" && next.value.turnId === options.lastTurnId)) break;
+      }
+      result.snapshot = await recovery.session.snapshot();
+      result.closeOutcome = await recovery.session.close({ reason: "fixture complete" }).then(() => "closed", (error: unknown) => String(error instanceof Error ? error.message : error));
     }
-    expect(delivered.filter(event => event.eventType === "session.failed")).toEqual([]);
-    expect(delivered.filter(event => event.eventType === "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
-    expect(delivered.filter(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1"]);
-    expect(delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1"]);
-    if (withResult) {
-      expect(delivered.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
-      expect(await recovery.session!.snapshot()).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" },
-        terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
-      expect((await calls()).filter(entry => entry.command === "tool.resolve").map(entry => [entry.params.turnId, entry.params.callId, entry.params.error ?? null]))
-        .toEqual([["provider-1", "call-provider-finish", null]]);
-    } else expect(delivered.some(event => event.eventType === "run.result.proposed")).toBe(false);
-    await expect(recovery.session!.close({ reason: "fixture complete" })).resolves.toBeUndefined();
-    expect(unsettled(diagnostics)).toEqual([]);
-    expect(await durableState(root)).not.toContain("conflicting duplicate");
+    return { ...result, journalled: await calls(), durable: await durableState(root) };
   } catch (error) {
     throw new Error(`${String(error)}\n${await readFile(join(root, "native.stderr"), "utf8").catch(() => "")}`, { cause: error });
   } finally {
@@ -338,4 +340,79 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
     server.closeAllConnections(); await new Promise<void>(done => server.close(() => done()));
     await rm(root, { recursive: true, force: true });
   }
+}
+
+type RestartRun = Awaited<ReturnType<typeof runRestartScenario>>;
+const ofType = (run: RestartRun, eventType: string) => run.delivered.filter(event => event.eventType === eventType);
+const resolvedCalls = (journalled: Array<Record<string, any>>) => journalled.filter(entry => entry.command === "tool.resolve")
+  .map(entry => [entry.params.turnId, entry.params.callId, entry.params.error ?? null]);
+const armedWaits = (journalled: Array<Record<string, any>>) => journalled.filter(entry => entry.command === "session.provider_turn" && entry.params.armed === true).length;
+const expectRecoveredCleanly = (run: RestartRun) => {
+  expect(run.recovered, run.reason).toBe(true);
+  expect(run.recoveredPid).toBe(run.pid);
+  expect(ofType(run, "session.failed")).toEqual([]);
+  expect(run.closeOutcome).toBe("closed");
+  expect(unsettled(run.diagnostics)).toEqual([]);
+  expect(run.durable).not.toContain("conflicting duplicate");
+};
+
+it.skipIf(process.platform === "win32").each([true, false])("delivers the provider's own turn that ran while the controller was away, after a restart during the wait (result: %s)", async withResult => {
+  const run = await runRestartScenario(`live provider-turn ${withResult ? "provider-result-resolved " : ""}provider-goal-at-terminal provider-turn-delay-ms=1500`, { waitMs: 2_500, lastTurnId: "provider-1" });
+  expect(run.checkpoint).toMatchObject({ activeTurnId: null, semanticResult: null, awaitingProviderTurn: true });
+  expectRecoveredCleanly(run);
+  expect(ofType(run, "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
+  expect(ofType(run, "item.completed").filter(event => event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1"]);
+  expect(run.delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1"]);
+  if (withResult) {
+    expect(ofType(run, "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
+    expect(run.snapshot).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" }, terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
+    expect(resolvedCalls(run.journalled)).toEqual([["provider-1", "call-provider-finish", null]]);
+  } else expect(ofType(run, "run.result.proposed")).toEqual([]);
+}, 60_000);
+
+it.skipIf(process.platform === "win32")("delivers and answers the finish call of a provider turn that was still waiting for it at a restart", async () => {
+  const run = await runRestartScenario("live provider-turn provider-result-resolved provider-goal-at-terminal provider-turn-delay-ms=1500", { waitMs: 2_500, lastTurnId: "provider-1" });
+  expect(armedWaits(run.atRestart.journalled)).toBe(1);
+  expect(resolvedCalls(run.atRestart.journalled)).toEqual([]);
+  expect(run.atRestart.durable).toContain("call-provider-finish");
+  expectRecoveredCleanly(run);
+  expect(ofType(run, "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
+  expect(run.serverRequests.map(request => [request.params.turnId, request.params.tool, request.response.success])).toEqual([["provider-1", "paperclip_finish", true]]);
+  expect(resolvedCalls(run.journalled)).toEqual([["provider-1", "call-provider-finish", null]]);
+  expect(ofType(run, "turn.completed").map(event => event.turnId)).toEqual(["provider-1"]);
+  expect(ofType(run, "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
+  expect(run.snapshot).toMatchObject({ activeTurnId: null, semanticResult: { reportedWorkDisposition: "done" }, terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
+}, 60_000);
+
+it.skipIf(process.platform === "win32")("delivers the rest of a provider turn that was still running at a restart once, in order", async () => {
+  const tokens = "live provider-turn provider-goal-at-terminal provider-turn-delay-ms=1500";
+  const run = await runRestartScenario(`${tokens} provider-turn-pause`, { waitMs: 2_500, lastTurnId: "provider-1", resumeTokens: tokens });
+  expect(run.atRestart.durable).toContain("Claude is still working.");
+  expect(run.atRestart.durable).not.toContain("Claude finished its own work.");
+  expectRecoveredCleanly(run);
+  const turn = run.delivered.filter(event => event.turnId === "provider-1");
+  expect(turn.map(event => [event.eventType, event.payload.kind ?? null])).toEqual([["turn.started", null], ["item.delta", "agentMessage"], ["item.delta", "agentMessage"],
+    ["item.completed", "usage"], ["item.completed", "agentMessage"], ["turn.completed", null]]);
+  expect(turn[0]!.payload.origin).toBe("provider");
+  const sequence = run.delivered.map(event => event.sourceSeq);
+  expect(sequence).toEqual([...new Set(sequence)].sort((left, right) => left - right));
+  expect(ofType(run, "run.result.proposed")).toEqual([]);
+  expect(run.serverRequests).toEqual([]);
+  expect(resolvedCalls(run.journalled)).toEqual([]);
+}, 60_000);
+
+it.skipIf(process.platform === "win32")("delivers two provider turns that the runner started while the controller was away, in order", async () => {
+  const run = await runRestartScenario("live provider-turn provider-turns=live/resolved provider-goal-at-terminal provider-turn-delay-ms=1000", { waitMs: 3_500, lastTurnId: "provider-2" });
+  expect(run.atRestart.journalled.filter(entry => entry.command === "session.provider_turn").map(entry => [entry.params.turnId, entry.params.armed]))
+    .toEqual([[expect.any(String), true], ["provider-1", true]]);
+  expect(resolvedCalls(run.atRestart.journalled)).toEqual([]);
+  expectRecoveredCleanly(run);
+  expect(ofType(run, "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"], ["provider-2", "provider"]]);
+  expect(ofType(run, "turn.completed").map(event => [event.turnId, event.payload.awaitingProviderTurn ?? false])).toEqual([["provider-1", true], ["provider-2", false]]);
+  expect(ofType(run, "item.completed").filter(event => event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1", "provider-2"]);
+  expect(run.delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1", "provider-2"]);
+  expect(ofType(run, "run.result.proposed").map(event => event.turnId)).toEqual(["provider-2"]);
+  expect(run.serverRequests.map(request => [request.params.turnId, request.params.tool, request.response.success])).toEqual([["provider-2", "paperclip_finish", true]]);
+  expect(resolvedCalls(run.journalled)).toEqual([["provider-2", "call-provider-finish", null]]);
+  expect(run.snapshot).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" }, terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
 }, 60_000);
