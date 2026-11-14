@@ -35,12 +35,15 @@ function qualifiedProfile(agent: "claude" | "codex") {
 }
 
 let scenario = 0;
+const durableState = async (root: string) => (await Promise.all(["control-plane/control-plane-state.json", "runner/runner-state.json"]
+  .map(path => readFile(join(root, path), "utf8").catch(() => "")))).join("\n");
 
 async function runProviderTurnScenario(tokens: string, options: { agent?: "claude" | "codex"; capMs?: number; providerStartedTurns?: boolean } = {}) {
   const agent = options.agent ?? "claude";
   const providerStartedTurns = options.providerStartedTurns ?? agent === "claude";
   const turnStarts: Array<Record<string, unknown>> = [];
   const notificationMethods: string[] = [];
+  const diagnostics: string[] = [];
   const n = ++scenario;
   const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-")));
   const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
@@ -70,7 +73,7 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
   const runnerPids = new Set<number>();
   const bundle = createCapabilityRunnerdCodexTransport({
     provider: "acpx", acpxAgent: agent, ...(providerStartedTurns ? { providerStartedTurns: true } : {}),
-    runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
+    onDiagnostic: message => diagnostics.push(message), runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
     runnerArtifact: readRunnerdArtifactBinding(binary), codexSourceRecoveryVersion: 1, acpxSourceRecoveryVersion: 1,
     lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null }, runnerProcessReconnectGraceMs: null, runnerReconnectGraceMs: 3_000,
     controlPlaneRegistration: async next => {
@@ -122,12 +125,13 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
       providerTurnWait: options.capMs === undefined ? undefined : { capMs: options.capMs },
     }).then(() => "finalized", (error: unknown) => String(error instanceof Error ? error.message : error));
     const elapsedMs = Date.now() - started;
-    await bundle.transport.close().catch(() => undefined);
+    const closeOutcome = await bundle.transport.close().then(() => "closed", (error: unknown) => String(error instanceof Error ? error.message : error));
+    const durable = await durableState(root);
     const journalled = await calls();
     const providerPids = journalled.flatMap(entry => [entry.processStart, entry.childPid]).filter((pid): pid is number => typeof pid === "number");
     await vi.waitFor(() => { for (const pid of providerPids) expect(alive(pid)).toBe(false); }, { timeout: 5_000, interval: 50 }).catch(() => undefined);
     const providerProcesses = providerPids.map(pid => ({ pid, exited: !alive(pid) }));
-    return { outcome, appended, completeRun, resolveMissingResult, journalled, providerProcesses, root, elapsedMs, turnStarts, notificationMethods };
+    return { outcome, appended, completeRun, resolveMissingResult, journalled, providerProcesses, root, elapsedMs, turnStarts, notificationMethods, closeOutcome, diagnostics, durable };
   } catch (error) {
     const diagnostics = (await readFile(join(root, "native.stderr"), "utf8").catch(() => ""))
       + (await readFile(join(root, "diagnostics", "runnerd.stderr.log"), "utf8").catch(() => ""));
@@ -142,9 +146,15 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
 }
 
 const sidecarCommands = (journalled: Array<Record<string, unknown>>) => journalled.filter(entry => typeof entry.command === "string").map(entry => entry.command);
+const unsettled = (messages: string[]) => messages.filter(message => message.startsWith("native_session_settlement_incomplete"));
+const expectCleanClose = (run: Awaited<ReturnType<typeof runProviderTurnScenario>>) => {
+  expect(run.closeOutcome).toBe("closed");
+  expect(unsettled(run.diagnostics)).toEqual([]);
+  expect(run.durable).not.toContain("conflicting duplicate");
+};
 
 it.skipIf(process.platform === "win32")("continues a run in the provider's own turn after background work and settles its result", async () => {
-  const run = await runProviderTurnScenario("live provider-turn provider-result");
+  const run = await runProviderTurnScenario("live provider-turn provider-result-resolved");
   expect(run.outcome).toBe("finalized");
   expect(run.completeRun).toHaveBeenCalledOnce();
   expect(run.resolveMissingResult).not.toHaveBeenCalled();
@@ -157,6 +167,12 @@ it.skipIf(process.platform === "win32")("continues a run in the provider's own t
   expect(sidecarCommands(run.journalled)).toContain("session.provider_turn");
   expect(run.turnStarts).toEqual([expect.objectContaining({ providerStartedTurns: true })]);
   expect(run.notificationMethods).toContain("paperclip/runTerminal");
+  expect(run.appended.filter(event => event.eventType === "run.result.accepted")).toHaveLength(1);
+  expect(run.appended.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
+  expect(run.appended.filter(event => event.eventType === "turn.completed").map(event => event.turnId)).toContain("provider-1");
+  const resolved = run.journalled.filter(entry => entry.command === "tool.resolve");
+  expect(resolved.map(entry => [entry.params.turnId, entry.params.callId, entry.params.error ?? null])).toEqual([["provider-1", "call-provider-finish", null]]);
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("keeps a Claude run on today's path when the caller does not ask for provider-started turns", async () => {
@@ -168,6 +184,7 @@ it.skipIf(process.platform === "win32")("keeps a Claude run on today's path when
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
   expect(run.appended.some(event => event.payload.origin === "provider")).toBe(false);
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("ends the wait at the cap and takes today's missing-result path when the provider never starts its turn", async () => {
@@ -180,6 +197,7 @@ it.skipIf(process.platform === "win32")("ends the wait at the cap and takes toda
   expect(run.appended.some(event => event.payload.origin === "provider")).toBe(false);
   expect(run.providerProcesses.length).toBeGreaterThan(1);
   expect(run.providerProcesses.filter(entry => !entry.exited)).toEqual([]);
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("ends the wait in seconds, not at the cap, when the provider process is lost while awaiting", async () => {
@@ -188,6 +206,7 @@ it.skipIf(process.platform === "win32")("ends the wait in seconds, not at the ca
   expect(run.completeRun).not.toHaveBeenCalled();
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(true);
   expect(run.elapsedMs).toBeLessThan(15_000);
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("ends the wait in seconds, not at the cap, when the sidecar exits while awaiting", async () => {
@@ -195,6 +214,9 @@ it.skipIf(process.platform === "win32")("ends the wait in seconds, not at the ca
   expect(run.completeRun).not.toHaveBeenCalled();
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(true);
   expect(run.elapsedMs).toBeLessThan(15_000);
+  expect(run.closeOutcome).toBe("provider_transport_failed: runner did not durably suspend before checkpoint");
+  expect(unsettled(run.diagnostics)).toEqual([expect.stringContaining('"proofWindowEnd":"suspend_not_completed"')]);
+  expect(run.durable).not.toContain("conflicting duplicate");
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("leaves a Claude turn without background work exactly as before", async () => {
@@ -203,6 +225,7 @@ it.skipIf(process.platform === "win32")("leaves a Claude turn without background
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
   expect(run.appended.some(event => event.payload.status === "provider_turn_wait_ended")).toBe(false);
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in", async () => {
@@ -212,6 +235,7 @@ it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in",
   expect(run.notificationMethods).not.toContain("paperclip/runTerminal");
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
+  expectCleanClose(run);
 }, 60_000);
 
 it.skipIf(process.platform === "win32").each([true, false])("delivers the provider's own turn that ran while the controller was away, after a restart during the wait (result: %s)", async withResult => {
@@ -220,9 +244,10 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
   const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
   await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
   await writeFile(script, "qualified fixture entry");
-  await writeFile(join(root, "background"), `live provider-turn ${withResult ? "provider-result " : ""}provider-goal-at-terminal provider-turn-delay-ms=1500`);
+  await writeFile(join(root, "background"), `live provider-turn ${withResult ? "provider-result-resolved " : ""}provider-goal-at-terminal provider-turn-delay-ms=1500`);
   await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(join(root, "background"))} --spawn-owned-child\n`, { mode: 0o700 });
   let authority: DurablePrpControlPlane | null = null, registrations = 0;
+  const diagnostics: string[] = [];
   const server = createServer();
   server.on("upgrade", (request, socket, head) => authority ? authority.handleUpgrade(request, socket, "/runner", head) : socket.destroy());
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
@@ -242,7 +267,7 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
   const runnerPids = new Set<number>();
   let requirements: RunnerProviderLaunchRequirements | undefined;
   const options: CapabilityRunnerdCodexTransportOptions = {
-    provider: "acpx", acpxAgent: "claude", providerStartedTurns: true, runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
+    provider: "acpx", acpxAgent: "claude", providerStartedTurns: true, onDiagnostic: message => diagnostics.push(message), runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
     runnerArtifact: readRunnerdArtifactBinding(binary), codexSourceRecoveryVersion: 1, acpxSourceRecoveryVersion: 1,
     lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null }, runnerProcessReconnectGraceMs: null, runnerReconnectGraceMs: 10_000,
     controlPlaneRegistration: async next => {
@@ -295,14 +320,16 @@ it.skipIf(process.platform === "win32").each([true, false])("delivers the provid
     expect(delivered.filter(event => event.eventType === "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
     expect(delivered.filter(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1"]);
     expect(delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1"]);
-    if (!withResult) {
-      expect(delivered.some(event => event.eventType === "run.result.proposed")).toBe(false);
-      await expect(recovery.session!.close({ reason: "fixture complete" })).resolves.toBeUndefined();
-      return;
-    }
-    expect(delivered.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
-    expect(await recovery.session!.snapshot()).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" },
-      terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
+    if (withResult) {
+      expect(delivered.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
+      expect(await recovery.session!.snapshot()).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" },
+        terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
+      expect((await calls()).filter(entry => entry.command === "tool.resolve").map(entry => [entry.params.turnId, entry.params.callId, entry.params.error ?? null]))
+        .toEqual([["provider-1", "call-provider-finish", null]]);
+    } else expect(delivered.some(event => event.eventType === "run.result.proposed")).toBe(false);
+    await expect(recovery.session!.close({ reason: "fixture complete" })).resolves.toBeUndefined();
+    expect(unsettled(diagnostics)).toEqual([]);
+    expect(await durableState(root)).not.toContain("conflicting duplicate");
   } catch (error) {
     throw new Error(`${String(error)}\n${await readFile(join(root, "native.stderr"), "utf8").catch(() => "")}`, { cause: error });
   } finally {
