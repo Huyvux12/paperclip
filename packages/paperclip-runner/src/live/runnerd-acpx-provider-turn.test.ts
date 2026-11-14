@@ -36,8 +36,11 @@ function qualifiedProfile(agent: "claude" | "codex") {
 
 let scenario = 0;
 
-async function runProviderTurnScenario(tokens: string, options: { agent?: "claude" | "codex"; capMs?: number } = {}) {
+async function runProviderTurnScenario(tokens: string, options: { agent?: "claude" | "codex"; capMs?: number; providerStartedTurns?: boolean } = {}) {
   const agent = options.agent ?? "claude";
+  const providerStartedTurns = options.providerStartedTurns ?? agent === "claude";
+  const turnStarts: Array<Record<string, unknown>> = [];
+  const notificationMethods: string[] = [];
   const n = ++scenario;
   const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-")));
   const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
@@ -66,10 +69,18 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
     interactionResponses: [], credentialBindings: [] };
   const runnerPids = new Set<number>();
   const bundle = createCapabilityRunnerdCodexTransport({
-    provider: "acpx", acpxAgent: agent, runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
+    provider: "acpx", acpxAgent: agent, ...(providerStartedTurns ? { providerStartedTurns: true } : {}),
+    runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
     runnerArtifact: readRunnerdArtifactBinding(binary), codexSourceRecoveryVersion: 1, acpxSourceRecoveryVersion: 1,
     lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null }, runnerProcessReconnectGraceMs: null, runnerReconnectGraceMs: 3_000,
-    controlPlaneRegistration: async next => { authority = next; return { connectUrl: `ws://127.0.0.1:${address.port}/runner`, release: () => { authority = null; } }; },
+    controlPlaneRegistration: async next => {
+      authority = next;
+      const queueCommand = next.queueCommand.bind(next);
+      next.queueCommand = (type, payload, ...rest) => {
+        if (type === "turn.start") turnStarts.push(structuredClone(payload ?? {}));
+        return queueCommand(type, payload, ...rest);
+      };
+      return { connectUrl: `ws://127.0.0.1:${address.port}/runner`, release: () => { authority = null; } }; },
     prepareLaunch: async launch => ({ configurationId: `initial-${launch.identity.runId}`, requirementsDigest: runnerLaunchRequirementsDigest(launch),
       provider: createRunnerProviderLaunch(launch, { options: {}, root, cwd: root, codexHome: root, codexCommand: "", providerNodeCommand: wrapper, opencodeProxyPath: "", acpxSidecarPath: script }) }),
     runnerProcessLauncher: spec => {
@@ -83,6 +94,10 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
       return { child, completion: new Promise((done, reject) => { child.once("error", reject); child.once("exit", (code, signal) => done({ code, signal, stdout: "", stderr: "" })); }) };
     },
   });
+  const notifications = bundle.transport.notifications.bind(bundle.transport);
+  bundle.transport.notifications = () => ({ async *[Symbol.asyncIterator]() {
+    for await (const notification of notifications()) { notificationMethods.push(notification.method); yield notification; }
+  } });
   const calls = async () => (await readFile(journal, "utf8").catch(() => "")).trim().split("\n").filter(Boolean)
     .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
   const appended: PrpEvent[] = [];
@@ -112,7 +127,7 @@ async function runProviderTurnScenario(tokens: string, options: { agent?: "claud
     const providerPids = journalled.flatMap(entry => [entry.processStart, entry.childPid]).filter((pid): pid is number => typeof pid === "number");
     await vi.waitFor(() => { for (const pid of providerPids) expect(alive(pid)).toBe(false); }, { timeout: 5_000, interval: 50 }).catch(() => undefined);
     const providerProcesses = providerPids.map(pid => ({ pid, exited: !alive(pid) }));
-    return { outcome, appended, completeRun, resolveMissingResult, journalled, providerProcesses, root, elapsedMs };
+    return { outcome, appended, completeRun, resolveMissingResult, journalled, providerProcesses, root, elapsedMs, turnStarts, notificationMethods };
   } catch (error) {
     const diagnostics = (await readFile(join(root, "native.stderr"), "utf8").catch(() => ""))
       + (await readFile(join(root, "diagnostics", "runnerd.stderr.log"), "utf8").catch(() => ""));
@@ -140,6 +155,19 @@ it.skipIf(process.platform === "win32")("continues a run in the provider's own t
   expect(started[1]).toMatchObject({ turnId: "provider-1", payload: { origin: "provider" } });
   expect(run.appended.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toContain("provider-1");
   expect(sidecarCommands(run.journalled)).toContain("session.provider_turn");
+  expect(run.turnStarts).toEqual([expect.objectContaining({ providerStartedTurns: true })]);
+  expect(run.notificationMethods).toContain("paperclip/runTerminal");
+}, 60_000);
+
+it.skipIf(process.platform === "win32")("keeps a Claude run on today's path when the caller does not ask for provider-started turns", async () => {
+  const run = await runProviderTurnScenario("live provider-turn provider-result", { providerStartedTurns: false });
+  expect(run.outcome).toContain("native_finalization_missing");
+  expect(run.turnStarts).toHaveLength(1);
+  expect(run.turnStarts[0]).not.toHaveProperty("providerStartedTurns");
+  expect(run.notificationMethods).not.toContain("paperclip/runTerminal");
+  expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
+  expect(run.appended.some(event => event.payload.origin === "provider")).toBe(false);
+  expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("ends the wait at the cap and takes today's missing-result path when the provider never starts its turn", async () => {
@@ -178,8 +206,10 @@ it.skipIf(process.platform === "win32")("leaves a Claude turn without background
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in", async () => {
-  const run = await runProviderTurnScenario("live provider-turn provider-result", { agent: "codex" });
+  const run = await runProviderTurnScenario("live provider-turn provider-result", { agent: "codex", providerStartedTurns: true });
   expect(run.outcome).toContain("native_finalization_missing");
+  expect(run.turnStarts[0]).not.toHaveProperty("providerStartedTurns");
+  expect(run.notificationMethods).not.toContain("paperclip/runTerminal");
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
 }, 60_000);

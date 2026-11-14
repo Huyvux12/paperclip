@@ -1709,6 +1709,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   recoveryLaunch?: { requirements: RunnerProviderLaunchRequirements };
   opencodePermissionMode?: NativeOpenCodePermissionMode;
   acpxAgent?: QualifiedAcpxAgent;
+  providerStartedTurns?: boolean;
   /** Explicit evaluation-only candidate selection, never derived from persisted session input. */
   acpxCandidateProfile?: "pi" | "cursor" | "copilot" | "kimi";
   /** Server/operator authority; never derived from persisted agent or provider input. */
@@ -7784,7 +7785,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   #providerStartedTurns() {
-    return this.options.provider === "acpx" && this.options.acpxAgent === "claude";
+    return this.options.providerStartedTurns === true && this.options.provider === "acpx" && this.options.acpxAgent === "claude";
   }
 
   async #deliverNotificationsBefore(sourceSeq: number) {
