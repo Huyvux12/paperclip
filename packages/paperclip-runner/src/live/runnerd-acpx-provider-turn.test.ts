@@ -214,13 +214,13 @@ it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in",
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
 }, 60_000);
 
-it.skipIf(process.platform === "win32")("delivers the provider's own turn that ran while the controller was away, after a restart during the wait", async () => {
+it.skipIf(process.platform === "win32").each([true, false])("delivers the provider's own turn that ran while the controller was away, after a restart during the wait (result: %s)", async withResult => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-restart-")));
   const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
   const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
   await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
   await writeFile(script, "qualified fixture entry");
-  await writeFile(join(root, "background"), "live provider-turn provider-result provider-goal-at-terminal provider-turn-delay-ms=1500");
+  await writeFile(join(root, "background"), `live provider-turn ${withResult ? "provider-result " : ""}provider-goal-at-terminal provider-turn-delay-ms=1500`);
   await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(join(root, "background"))} --spawn-owned-child\n`, { mode: 0o700 });
   let authority: DurablePrpControlPlane | null = null, registrations = 0;
   const server = createServer();
@@ -295,6 +295,11 @@ it.skipIf(process.platform === "win32")("delivers the provider's own turn that r
     expect(delivered.filter(event => event.eventType === "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
     expect(delivered.filter(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1"]);
     expect(delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1"]);
+    if (!withResult) {
+      expect(delivered.some(event => event.eventType === "run.result.proposed")).toBe(false);
+      await expect(recovery.session!.close({ reason: "fixture complete" })).resolves.toBeUndefined();
+      return;
+    }
     expect(delivered.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
     expect(await recovery.session!.snapshot()).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" },
       terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
