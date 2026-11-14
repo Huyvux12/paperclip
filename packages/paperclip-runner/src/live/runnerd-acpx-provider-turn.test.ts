@@ -238,7 +238,7 @@ it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in",
   expectCleanClose(run);
 }, 60_000);
 
-async function runRestartScenario(tokens: string, options: { waitMs: number; lastTurnId: string; resumeTokens?: string }) {
+async function runRestartScenario(tokens: string, options: { waitMs: number; lastTurnId: string }) {
   const n = ++scenario;
   const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-restart-")));
   const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
@@ -321,7 +321,6 @@ async function runRestartScenario(tokens: string, options: { waitMs: number; las
     const result = { checkpoint, pid, recoveredPid: second.evidence().runnerPid, recovered: recovery.recovered, reason: recovery.reason, atRestart, serverRequests,
       delivered: [] as PrpEvent[], snapshot: null as unknown, closeOutcome: "not closed", journalled: [] as Array<Record<string, any>>, diagnostics, durable: "" };
     if (recovery.session) {
-      if (options.resumeTokens !== undefined) await writeFile(background, options.resumeTokens);
       const events = recovery.session.events()[Symbol.asyncIterator]();
       const timeout = new Promise<null>(done => setTimeout(() => done(null), 15_000));
       for (let next = await Promise.race([events.next(), timeout]); next && !next.done; next = await Promise.race([events.next(), timeout])) {
@@ -385,10 +384,11 @@ it.skipIf(process.platform === "win32")("delivers and answers the finish call of
 }, 60_000);
 
 it.skipIf(process.platform === "win32")("delivers the rest of a provider turn that was still running at a restart once, in order", async () => {
-  const tokens = "live provider-turn provider-goal-at-terminal provider-turn-delay-ms=1500";
-  const run = await runRestartScenario(`${tokens} provider-turn-pause`, { waitMs: 2_500, lastTurnId: "provider-1", resumeTokens: tokens });
+  const run = await runRestartScenario("live provider-turn provider-goal-at-terminal provider-turn-delay-ms=1500 provider-turn-until-snapshot", { waitMs: 2_500, lastTurnId: "provider-1" });
   expect(run.atRestart.durable).toContain("Claude is still working.");
   expect(run.atRestart.durable).not.toContain("Claude finished its own work.");
+  expect(sidecarCommands(run.atRestart.journalled)).not.toContain("session.snapshot");
+  expect(sidecarCommands(run.journalled).filter(command => command === "session.snapshot")).toHaveLength(1);
   expectRecoveredCleanly(run);
   const turn = run.delivered.filter(event => event.turnId === "provider-1");
   expect(turn.map(event => [event.eventType, event.payload.kind ?? null])).toEqual([["turn.started", null], ["item.delta", "agentMessage"], ["item.delta", "agentMessage"],

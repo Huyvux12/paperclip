@@ -118,14 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let (line_sender, lines) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if line_sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut next_sequence = 1_u64;
     let mut goal = Value::Null;
@@ -183,25 +176,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    loop {
-        if open_provider_turn.is_some()
-            && !provider_turn_tokens()
-                .iter()
-                .any(|token| token == "provider-turn-pause")
-        {
-            open_provider_turn = None;
-            next_sequence = finish_provider_turn(&mut stdout, next_sequence, &source_run)?;
-        }
-        let wait = if open_provider_turn.is_some() {
-            Duration::from_millis(25)
-        } else {
-            Duration::from_secs(3_600)
-        };
-        let line = match lines.recv_timeout(wait) {
-            Ok(line) => line,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+    for line in stdin.lock().lines() {
         let request: Value = serde_json::from_str(&line?)?;
         let id = request
             .get("id")
@@ -502,6 +477,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "error":{"code":"session_open_failed","message":"The replacement provider could not open.","retryable":false}});
             }
             write_json(&mut stdout, &response)?;
+            if command == "session.snapshot" && open_provider_turn.take().is_some() {
+                next_sequence = finish_provider_turn(&mut stdout, next_sequence, &source_run)?;
+            }
             if command == "session.open" && args.iter().any(|arg| arg == "--emit-process") {
                 write_json(
                     &mut stdout,
@@ -1765,7 +1743,10 @@ fn write_provider_turn(
         *pending_finish = Some(turn_id);
         return Ok(sequence + 1);
     }
-    if tokens.iter().any(|token| token == "provider-turn-pause") {
+    if tokens
+        .iter()
+        .any(|token| token == "provider-turn-until-snapshot")
+    {
         write_json(
             output,
             &frame(
