@@ -298,6 +298,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if armed && tokens.iter().any(|token| token == "provider-turn-hold") {
                 continue;
             }
+            if let Some(delay) = tokens
+                .iter()
+                .find_map(|token| token.strip_prefix("provider-turn-delay-ms="))
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|_| armed)
+            {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             if let (true, Some(run)) = (armed, pending_provider_run.take()) {
                 next_sequence = write_provider_turn(&mut stdout, next_sequence, &run)?;
                 provider_rearmable = tokens.iter().any(|token| token == "provider-terminal-live");
@@ -1677,14 +1685,19 @@ fn write_provider_turn(
     } else {
         0
     };
-    write_json(
-        output,
-        &frame(
-            sequence,
-            "runtime.turn_terminal",
-            json!({"status":"completed","stopReason":"end_turn","backgroundTasks":{"live":live}}),
-        ),
-    )?;
+    let mut terminal =
+        json!({"status":"completed","stopReason":"end_turn","backgroundTasks":{"live":live}});
+    if tokens
+        .iter()
+        .any(|token| token == "provider-goal-at-terminal")
+    {
+        terminal["goalAtTerminal"] = json!({"schema":"paperclip.session_goal.snapshot.v1",
+            "providerRevision":1_000_000,"goal":null,"workingNow":false,
+            "sessionGoals":{"availability":"unsupported","actions":[],"autonomousUpdates":false,
+                "persistentAcrossResume":false,"maxObjectiveChars":4000,"tokenBudgetControl":false,
+                "usageReporting":false}});
+    }
+    write_json(output, &frame(sequence, "runtime.turn_terminal", terminal))?;
     Ok(sequence + 1)
 }
 

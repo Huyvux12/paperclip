@@ -8,8 +8,8 @@ import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
 import type { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 import { QUALIFIED_ACPX_PROFILES, resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
-import { createCapabilityRunnerdCodexTransport, readRunnerdArtifactBinding } from "./runnerd-codex-transport.js";
-import { createRunnerProviderLaunch, runnerLaunchRequirementsDigest } from "./runner-provider-launch.js";
+import { createCapabilityRunnerdCodexTransport, readRunnerdArtifactBinding, type CapabilityRunnerdCodexTransport, type CapabilityRunnerdCodexTransportOptions } from "./runnerd-codex-transport.js";
+import { createRunnerProviderLaunch, runnerLaunchRequirementsDigest, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 import { defaultCapabilityRunnerdBinary } from "../../test/support/runnerd-transport.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { createNativeSessionBackend } from "../backends/native-backend-factory.js";
@@ -212,4 +212,98 @@ it.skipIf(process.platform === "win32")("never opts a non-Claude ACPX agent in",
   expect(run.notificationMethods).not.toContain("paperclip/runTerminal");
   expect(run.appended.some(event => event.payload.awaitingProviderTurn === true)).toBe(false);
   expect(sidecarCommands(run.journalled)).not.toContain("session.provider_turn");
+}, 60_000);
+
+it.skipIf(process.platform === "win32")("delivers the provider's own turn that ran while the controller was away, after a restart during the wait", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "runner-acpx-provider-turn-restart-")));
+  const journal = join(root, "calls"), fault = join(root, "fault"), wrapper = join(root, "sidecar"), script = join(root, "sidecar-entry");
+  const binary = defaultCapabilityRunnerdBinary(), sidecar = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
+  await mkdir(join(root, "acpx"), { mode: 0o700 }); await mkdir(join(root, "diagnostics"), { mode: 0o700 });
+  await writeFile(script, "qualified fixture entry");
+  await writeFile(join(root, "background"), "live provider-turn provider-result provider-goal-at-terminal provider-turn-delay-ms=1500");
+  await writeFile(wrapper, `#!/bin/sh\nexec ${quote(sidecar)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(journal)} --source-fault ${quote(fault)} --background-tasks ${quote(join(root, "background"))} --spawn-owned-child\n`, { mode: 0o700 });
+  let authority: DurablePrpControlPlane | null = null, registrations = 0;
+  const server = createServer();
+  server.on("upgrade", (request, socket, head) => authority ? authority.handleUpgrade(request, socket, "/runner", head) : socket.destroy());
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("missing fixture listener");
+  const identity = { runnerInstanceId: "runner-provider-turn-restart", environmentLeaseId: "lease-provider-turn-restart", runId: "run-provider-turn-restart",
+    normalizedSessionId: "session-provider-turn-restart", turnId: "turn-provider-turn-restart", itemId: "item-provider-turn-restart" };
+  const nativeIdentity = { companyId: "company-restart", agentId: "agent", issueId: "issue", runId: identity.runId, sessionId: identity.normalizedSessionId };
+  const execution: NativeExecutionInput = { schema: "paperclip.native-execution-input.v1",
+    binding: { companyId: nativeIdentity.companyId, agentId: "agent", issueId: "issue", runId: identity.runId, executionWorkspaceId: "workspace" },
+    task: { identifier: "TASK-1", title: "Install and test", description: null, prompt: "Install and test", workMode: "standard" },
+    workspace: { cwd: root, repoUrl: null, repoRef: null, branchName: null },
+    session: { normalizedSessionId: identity.normalizedSessionId, driverKind: "acpx_runtime", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+    provider: { kind: "acpx", agent: "claude", model: "explicit-source-model", permissionPolicy: "interactive", profile: qualifiedProfile("claude") },
+    completionContract: { id: "contract", sha256: sha("contract"), schemaVersion: "paperclip.completion-contract.v1",
+      contract: { revision: "acpx-provider-turns-v1", objective: "Install and test", criteria: [{ id: "objective", requirement: "Install and test" }] } },
+    interactionResponses: [], credentialBindings: [] };
+  const runnerPids = new Set<number>();
+  let requirements: RunnerProviderLaunchRequirements | undefined;
+  const options: CapabilityRunnerdCodexTransportOptions = {
+    provider: "acpx", acpxAgent: "claude", providerStartedTurns: true, runnerBinary: binary, stateDirectory: root, prpIdentity: identity,
+    runnerArtifact: readRunnerdArtifactBinding(binary), codexSourceRecoveryVersion: 1, acpxSourceRecoveryVersion: 1,
+    lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null }, runnerProcessReconnectGraceMs: null, runnerReconnectGraceMs: 10_000,
+    controlPlaneRegistration: async next => {
+      const generation = ++registrations; authority = next;
+      return { connectUrl: `ws://127.0.0.1:${address.port}/runner`, release: () => { if (generation === registrations) authority = null; } };
+    },
+    prepareLaunch: async launch => {
+      requirements ??= structuredClone(launch);
+      return { configurationId: `initial-${launch.identity.runId}`, requirementsDigest: runnerLaunchRequirementsDigest(launch),
+        provider: createRunnerProviderLaunch(launch, { options: {}, root, cwd: root, codexHome: root, codexCommand: "", providerNodeCommand: wrapper, opencodeProxyPath: "", acpxSidecarPath: script }) };
+    },
+    runnerProcessLauncher: spec => {
+      const stderr = openSync(join(root, "native.stderr"), "a", 0o600);
+      const child = spawn(binary, [...spec.args, "--acpx-launch-authority-digest", sha("fixture authority"),
+        "--acpx-sidecar-command", wrapper, "--acpx-sidecar-command-sha256", sha(execFileSync("cat", [wrapper])),
+        "--acpx-sidecar-script", script, "--acpx-sidecar-script-sha256", sha("qualified fixture entry")],
+        { env: { PATH: process.env.PATH, HOME: root, ...spec.environment }, stdio: ["ignore", "ignore", stderr], detached: true });
+      closeSync(stderr);
+      if (child.pid) runnerPids.add(child.pid);
+      return { child, completion: new Promise((done, reject) => { child.once("error", reject); child.once("exit", (code, signal) => done({ code, signal, stdout: "", stderr: "" })); }) };
+    },
+  };
+  const calls = async () => (await readFile(journal, "utf8").catch(() => "")).trim().split("\n").filter(Boolean)
+    .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
+  const backend = (transport: CapabilityRunnerdCodexTransport) => createNativeSessionBackend(execution, { codexTransportFactory: () => transport.transport,
+    environment: { PAPERCLIP_WORKSPACE_CWD: root }, dynamicTools: [] });
+  try {
+    const first = createCapabilityRunnerdCodexTransport(options);
+    const session = await backend(first).openSession({ identity: nativeIdentity, workingDirectory: root });
+    await session.startTurn({ message: { role: "user", text: "Install and test." } });
+    for await (const event of session.events()) if (event.eventType === "turn.completed") break;
+    const checkpoint = await session.snapshot();
+    expect(checkpoint).toMatchObject({ activeTurnId: null, semanticResult: null, awaitingProviderTurn: true });
+    const pid = first.evidence().runnerPid!, startedAt = first.transport.processInfo!().startedAt;
+    await session.detachControllerForRestart!();
+    await new Promise(done => setTimeout(done, 2_500));
+    const second = createCapabilityRunnerdCodexTransport({ ...options, recoveryLaunch: { requirements: requirements! },
+      resumeProviderSession: { driverSessionId: checkpoint.sessionId, providerSessionId: checkpoint.providerSessionId!, providerIdentity: checkpoint.providerIdentity },
+      authorityRunId: identity.runId, runnerProcessLauncher: () => { throw new Error("duplicate runner launch"); },
+      adoptExistingRunner: { pid, processGroupId: pid, startedAt, isAlive: () => alive(pid), signal: () => false } });
+    const recovery = await backend(second).recoverSession!(checkpoint, { signal: new AbortController().signal });
+    expect(recovery.recovered, recovery.reason).toBe(true);
+    expect(second.evidence().runnerPid).toBe(pid);
+    const delivered: PrpEvent[] = [];
+    for await (const event of recovery.session!.events()) {
+      delivered.push(event);
+      if (event.eventType === "session.failed" || (event.eventType === "turn.completed" && event.turnId === "provider-1")) break;
+    }
+    expect(delivered.filter(event => event.eventType === "session.failed")).toEqual([]);
+    expect(delivered.filter(event => event.eventType === "turn.started").map(event => [event.turnId, event.payload.origin])).toEqual([["provider-1", "provider"]]);
+    expect(delivered.filter(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage").map(event => event.turnId)).toEqual(["provider-1"]);
+    expect(delivered.filter(event => event.payload.kind === "usage").map(event => event.turnId)).toEqual(["provider-1"]);
+    expect(delivered.filter(event => event.eventType === "run.result.proposed").map(event => event.turnId)).toEqual(["provider-1"]);
+    expect(await recovery.session!.snapshot()).toMatchObject({ semanticResult: { reportedWorkDisposition: "done" },
+      terminal: { turnTerminalState: "completed", runTerminalState: "succeeded" } });
+  } catch (error) {
+    throw new Error(`${String(error)}\n${await readFile(join(root, "native.stderr"), "utf8").catch(() => "")}`, { cause: error });
+  } finally {
+    for (const pid of runnerPids) kill(pid);
+    for (const entry of await calls()) if (entry.processStart) kill(entry.processStart);
+    server.closeAllConnections(); await new Promise<void>(done => server.close(() => done()));
+    await rm(root, { recursive: true, force: true });
+  }
 }, 60_000);
